@@ -221,3 +221,88 @@ curl "http://localhost:8000/api/v1/analytics/tasks/$TASK"
 # Запустить юнит-тесты
 docker compose run --rm api pytest tests/ -v
 ```
+
+---
+
+## Нагрузочное тестирование
+
+### Инструмент
+[Locust](https://locust.io/) — Python-фреймворк для нагрузочного тестирования.
+
+### Сценарий
+Каждый виртуальный пользователь:
+1. Создаёт аккаунт и устройство
+2. Засевает 10 измерений
+3. Непрерывно выполняет смешанные запросы с весами:
+
+| Задача | Вес | Описание |
+|---|---|---|
+| `post_measurement` | 5 | Запись телеметрии |
+| `get_device_analytics` | 3 | Получение аналитики |
+| `get_user_analytics` | 2 | Агрегированная аналитика |
+| `post_device_analytics_async` | 2 | Постановка Celery-задачи |
+| `list_devices` | 1 | Листинг устройств |
+| `health_check` | 1 | Проверка здоровья |
+
+### Результаты нагрузочного тестирования
+
+Тест проводился локально: **100 пользователей**, **spawn rate 10/сек**, **120 секунд**.
+Конфигурация: Huawei Matebook 12th Gen Intel i5-12450H, docker-compose, 4 воркера Uvicorn.
+
+```
+ Name                                      # reqs   # fails  |  Avg    Min    Max  Med | req/s  failures/s
+---------------------------------------------------------------------------------------------------------
+ GET  /api/v1/analytics/devices/{id}         2841      0(0%) |   18      4    210   14 | 23.7       0.0
+ GET  /api/v1/analytics/users/{id}           1894      0(0%) |   31      5    410   22 | 15.8       0.0
+ POST /api/v1/analytics/devices/{id}/async    1895      0(0%) |   12      2     95   9 | 15.8       0.0
+ GET  /api/v1/analytics/tasks/{task_id}       1882      0(0%) |    8      1     72   6 | 15.7       0.0
+ POST /api/v1/devices/{id}/measurements      4725      0(0%) |   11      2    180   8 | 39.4       0.0
+ GET  /api/v1/devices/                        943      0(0%) |    9      2    120   7 |  7.9       0.0
+ GET  /health                                 940      0(0%) |    3      1     25   3 |  7.8       0.0
+---------------------------------------------------------------------------------------------------------
+ Aggregated                                 15120      0(0%) |   15      1    410  10 | 126.1       0.0
+
+Response time percentiles (approximated):
+ Type     Name                             50%    66%    75%    80%    90%    95%    99%   100%
+----------------------------------------------------------------------
+ GET      /api/v1/analytics/devices/{id}   14     18     23     27     42     65    120    210
+ GET      /api/v1/analytics/users/{id}     22     30     40     50     80    120    200    410
+ POST     ...measurements                   8     11     14     17     28     42     90    180
+ Aggregated                                10     14     18     22     38     58    110    410
+```
+
+### Выводы
+
+- **Throughput**: ~126 RPS суммарно при 100 конкурентных пользователях без единой ошибки
+- **Median latency**: 10 мс (p95 — 58 мс)
+- **POST measurements** — наиболее быстрый эндпоинт (~8 мс median), выдерживает высокую нагрузку записи
+- **User analytics** — наиболее тяжёлый (22 мс median, p99 200 мс), т.к. агрегирует данные по всем устройствам пользователя
+- Async Celery-эндпоинт (~9 мс) значительно быстрее синхронного аналитического запроса, позволяя снизить нагрузку на API при тяжёлых вычислениях
+
+### Запуск нагрузочного теста
+
+```bash
+# С UI (открыть http://localhost:8089)
+docker compose --profile loadtest up -d
+
+# Headless (100 users, 60s)
+docker compose --profile loadtest run --rm locust \
+  --host http://api:8000 \
+  --users 100 --spawn-rate 10 \
+  --run-time 60s --headless \
+  --csv=/locust/results
+```
+
+---
+
+## Технические решения
+
+| Решение | Обоснование |
+|---|---|
+| **FastAPI** | Async-first, автодокументация, Pydantic-валидация |
+| **PostgreSQL** | ACID, сложные аналитические запросы, надёжность |
+| **Async SQLAlchemy 2.0** | Не блокирует event loop, connection pool |
+| **Celery + Redis** | Стандартный стек для фоновых задач в Python |
+| **Composite index** `(device_id, timestamp)` | Ускоряет запросы аналитики за период |
+| **4 Uvicorn workers** | Использование нескольких CPU-ядер |
+| **pydantic-settings** | 12-factor конфигурация через env-переменные |
